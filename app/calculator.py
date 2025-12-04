@@ -1,15 +1,32 @@
+"""
+Cosine Similarity Calculator - Production Version
+==================================================
+Uses Trafilatura for content extraction - the same approach Google/Chrome uses.
+
+Trafilatura is the best-performing open-source library for main content extraction,
+used by HuggingFace, IBM, Microsoft Research, Stanford, etc.
+
+It uses the same principles as Google's boilerplate detection:
+- Text density (text vs tags ratio)
+- Link density
+- Block position analysis
+- Paragraph structure
+"""
+
 import os
 import re
 import time
 import random
 from typing import Callable, Optional
+import json
 
 import requests
-from bs4 import BeautifulSoup
+import trafilatura
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from sentence_transformers import SentenceTransformer
 import numpy as np
+
 
 # ============================================================
 # CONFIGURATION
@@ -25,24 +42,15 @@ print(f"✅ Model loaded!")
 
 
 # ============================================================
-# GOOGLE SHEETS AUTH (Service Account)
+# GOOGLE SHEETS AUTH
 # ============================================================
 def get_sheets_service():
-    """
-    Get authenticated Google Sheets service using service account.
-    Expects GOOGLE_CREDENTIALS_JSON env var with the JSON content.
-    """
     creds_json = os.getenv("GOOGLE_CREDENTIALS_JSON")
     
     if not creds_json:
-        raise ValueError(
-            "GOOGLE_CREDENTIALS_JSON environment variable not set. "
-            "Set it to your service account JSON content."
-        )
+        raise ValueError("GOOGLE_CREDENTIALS_JSON environment variable not set.")
     
-    import json
     creds_dict = json.loads(creds_json)
-    
     credentials = service_account.Credentials.from_service_account_info(
         creds_dict,
         scopes=['https://www.googleapis.com/auth/spreadsheets']
@@ -68,17 +76,25 @@ def get_threshold_label(score: Optional[float]) -> str:
 
 
 # ============================================================
-# CONTENT SCRAPER (Simplified - no Playwright)
+# CONTENT SCRAPER - Using Trafilatura
 # ============================================================
 class ContentScraper:
-    """Lightweight scraper using requests only (Railway-friendly)"""
+    """
+    Production-grade content scraper using Trafilatura.
+    
+    Trafilatura uses the same principles as Google's content extraction:
+    - Text density analysis
+    - Link density detection
+    - DOM structure analysis
+    - Boilerplate pattern recognition
+    """
     
     USER_AGENTS = [
         'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
     ]
     
-    INVALID_PATTERNS = [
+    ERROR_PATTERNS = [
         r'access\s*denied', r'403\s*forbidden', r'404\s*not\s*found',
         r'captcha', r'cloudflare', r'just\s*a\s*moment',
         r'checking\s*your\s*browser', r'blocked', r'rate\s*limit'
@@ -92,40 +108,44 @@ class ContentScraper:
             'Accept-Language': 'en-US,en;q=0.9',
         })
     
-    def _extract_text(self, html: str) -> Optional[str]:
-        soup = BeautifulSoup(html, 'html.parser')
-        
-        # Remove noise
-        for tag in soup(['script', 'style', 'nav', 'header', 'footer', 'aside', 'noscript']):
-            tag.decompose()
-        
-        # Try content selectors
-        for selector in [soup.find('main'), soup.find('article'), soup.find('body')]:
-            if selector:
-                text = selector.get_text(separator=' ', strip=True)
-                text = ' '.join(text.split())
-                if len(text) >= MIN_CONTENT_LENGTH:
-                    return text
-        
-        return None
-    
-    def _is_valid_content(self, text: str) -> tuple[bool, str]:
+    def _is_error_page(self, text: str) -> bool:
+        """Check if content is an error page"""
         if not text:
-            return False, "Empty"
+            return True
+        text_lower = text.lower()[:500]
+        for pattern in self.ERROR_PATTERNS:
+            if re.search(pattern, text_lower, re.I):
+                return True
+        return False
+    
+    def _validate_content(self, text: str) -> tuple[bool, str]:
+        """Validate extracted content"""
+        if not text:
+            return False, "Empty content"
+        
         if len(text) < MIN_CONTENT_LENGTH:
             return False, f"Too short ({len(text)} chars)"
-        if len(text.split()) < MIN_WORDS:
-            return False, f"Too few words"
         
-        text_lower = text.lower()
-        for pattern in self.INVALID_PATTERNS:
-            if re.search(pattern, text_lower[:500], re.I):
-                return False, f"Error page detected"
+        if len(text.split()) < MIN_WORDS:
+            return False, f"Too few words ({len(text.split())})"
+        
+        if self._is_error_page(text):
+            return False, "Error page detected"
         
         return True, "Valid"
     
     def fetch(self, url: str) -> Optional[str]:
+        """
+        Fetch and extract main content from URL using Trafilatura.
+        
+        Trafilatura automatically:
+        - Removes navigation, headers, footers, sidebars
+        - Filters out ads and promotional content
+        - Extracts only the main article/page content
+        - Handles various HTML structures intelligently
+        """
         # Normalize URL
+        url = url.strip()
         if not url.startswith(('http://', 'https://')):
             url = f'https://{url}'
         
@@ -134,18 +154,37 @@ class ContentScraper:
             return self.cache[url]
         
         try:
+            # Fetch HTML
             self.session.headers['User-Agent'] = random.choice(self.USER_AGENTS)
             response = self.session.get(url, timeout=20, allow_redirects=True)
             response.raise_for_status()
             
-            text = self._extract_text(response.text)
-            is_valid, reason = self._is_valid_content(text)
+            html = response.text
+            
+            # Extract content using Trafilatura
+            # This is the key difference - Trafilatura uses Google-like algorithms:
+            # - Text density analysis
+            # - Link density detection  
+            # - DOM structure parsing
+            # - Boilerplate pattern matching
+            text = trafilatura.extract(
+                html,
+                include_comments=False,      # Exclude comments
+                include_tables=False,        # Exclude tables (often boilerplate)
+                no_fallback=False,           # Use fallback extraction if needed
+                favor_precision=True,        # Prefer precision over recall
+                deduplicate=True,            # Remove duplicate content
+            )
+            
+            # Validate
+            is_valid, reason = self._validate_content(text)
             
             if is_valid:
                 self.cache[url] = text
+                print(f"    ✅ Extracted {len(text)} chars, {len(text.split())} words")
                 return text
             else:
-                print(f"    ⚠ Invalid content: {reason}")
+                print(f"    ⚠ Invalid: {reason}")
                 return None
                 
         except Exception as e:
@@ -169,9 +208,11 @@ class SimilarityCalculator:
             return None
         
         try:
+            # Encode both texts
             emb1 = self.model.encode([content1], normalize_embeddings=True)[0]
             emb2 = self.model.encode([content2], normalize_embeddings=True)[0]
             
+            # Cosine similarity (dot product of normalized vectors)
             similarity = float(np.dot(emb1, emb2))
             return round(np.clip(similarity, -1.0, 1.0), 4)
             
@@ -187,7 +228,6 @@ class CosineCalculatorService:
     
     @staticmethod
     def col_letter_to_index(letter: str) -> int:
-        """Convert column letter to 0-based index (A=0, B=1, etc.)"""
         result = 0
         for char in letter.upper():
             result = result * 26 + (ord(char) - ord('A') + 1)
@@ -195,7 +235,6 @@ class CosineCalculatorService:
     
     @staticmethod
     def col_index_to_letter(index: int) -> str:
-        """Convert 0-based index to column letter"""
         result = ""
         index += 1
         while index > 0:
@@ -213,20 +252,14 @@ class CosineCalculatorService:
         threshold_col: Optional[str],
         progress_callback: Callable[[dict], None]
     ) -> dict:
-        """
-        Process spreadsheet and calculate cosine similarities.
-        Returns summary of results.
-        """
-        # Initialize
+        
         service = get_sheets_service()
         calculator = SimilarityCalculator()
         
-        # Column indices
         article_idx = CosineCalculatorService.col_letter_to_index(article_col)
         target_idx = CosineCalculatorService.col_letter_to_index(target_col)
         output_idx = CosineCalculatorService.col_letter_to_index(output_col)
         
-        # Threshold column: specified or next to output
         if threshold_col:
             threshold_idx = CosineCalculatorService.col_letter_to_index(threshold_col)
         else:
@@ -239,7 +272,6 @@ class CosineCalculatorService:
             "message": f"Reading {sheet_name}..."
         })
         
-        # Read data (skip header)
         result = service.spreadsheets().values().get(
             spreadsheetId=spreadsheet_id,
             range=f"'{sheet_name}'!A2:Z"
@@ -249,14 +281,12 @@ class CosineCalculatorService:
         if not rows:
             return {"status": "empty", "message": "No data found", "processed": 0}
         
-        # Find rows needing calculation
         rows_to_process = []
         for i, row in enumerate(rows, start=2):
             article_url = row[article_idx] if len(row) > article_idx else None
             target_url = row[target_idx] if len(row) > target_idx else None
             existing = row[output_idx] if len(row) > output_idx else None
             
-            # Skip if no URLs or already has score
             if not article_url or not target_url:
                 continue
             if existing and str(existing).strip() not in ['', 'N/A', '0', 'ERROR']:
@@ -275,7 +305,6 @@ class CosineCalculatorService:
             "message": f"Processing {total} rows..."
         })
         
-        # Process each row
         updates = []
         success = 0
         failed = 0
@@ -320,7 +349,6 @@ class CosineCalculatorService:
                 })
                 failed += 1
             
-            # Batch write every 10 updates
             if len(updates) >= 10:
                 service.spreadsheets().values().batchUpdate(
                     spreadsheetId=spreadsheet_id,
@@ -328,10 +356,8 @@ class CosineCalculatorService:
                 ).execute()
                 updates = []
             
-            # Rate limiting
             time.sleep(random.uniform(0.5, 1.5))
         
-        # Write remaining updates
         if updates:
             service.spreadsheets().values().batchUpdate(
                 spreadsheetId=spreadsheet_id,
